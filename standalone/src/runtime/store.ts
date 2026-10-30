@@ -177,7 +177,7 @@ export class RuntimeStore {
       if(name==='recall_context' || name==='get_episode') {
         const context=loadContext(this.#db,this.companion,this.capabilities(identity));
         this.checked(validateToolInput(name,input,context));
-        return success(name==='recall_context'?recallView(this.#db,input as ToolInput<'recall_context'>,context):episodeView(this.#db,input as ToolInput<'get_episode'>,context),context);
+        return success(name==='recall_context'?recallView(this.#db,input as ToolInput<'recall_context'>,context,this.#clock()):episodeView(this.#db,input as ToolInput<'get_episode'>,context),context);
       }
       const write=input as ToolInput<'correct_memory'|'set_memory_preference'|'retract_memory'>;
       return this.idempotent(principal,'user_edit',name,write.request_id,write,()=>{
@@ -275,7 +275,7 @@ export class RuntimeStore {
   setWorkerState(state:Partial<WorkerState>):void {this.#workerState={...this.#workerState,...state};}
   status(): Record<string,unknown> {
     const count=(table:string)=>Number(this.#db.prepare(`SELECT count(*) AS n FROM ${table}`).get()!.n);
-    return {phase:4,mcp_available:true,model_worker_enabled:this.#workerState.enabled,worker_status:{...this.#workerState},companion_id:this.companion,
+    return {phase:5,mcp_available:true,model_worker_enabled:this.#workerState.enabled,worker_status:{...this.#workerState},companion_id:this.companion,
       schema_version:this.#db.prepare('SELECT max(version) AS n FROM schema_migrations').get()!.n,
       journal_mode:this.#db.prepare('PRAGMA journal_mode').get()!.journal_mode,
       messages:count('turn_versions'),memories:count('memory_records'),receipts:count('write_requests'),

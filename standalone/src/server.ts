@@ -49,7 +49,7 @@ export async function startServer(store:RuntimeStore,options:{extractionProvider
   async function handle(request:IncomingMessage,response:ServerResponse):Promise<void> {
     requireState(request.headers.host===`127.0.0.1:${metadata.port}` && request.headers.origin===undefined,'FORBIDDEN','Only direct local clients are accepted');
     const route=request.url??'';
-    if(request.method==='GET' && route==='/health') {send(response,200,{ok:true,phase:4,instance_id});return;}
+    if(request.method==='GET' && route==='/health') {send(response,200,{ok:true,phase:5,instance_id});return;}
     const auth=(capability:Capability|null)=>{
       const match=/^Bearer (fmc_[A-Za-z0-9_-]{43})$/.exec(request.headers.authorization??'');
       requireState(match,'FORBIDDEN','Bearer credential required'); return store.authenticate(match[1]!,capability).id;

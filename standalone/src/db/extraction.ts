@@ -66,13 +66,19 @@ export class ExtractionRepository {
         return {memory,score:(same?10:0)+(source_state==='current'?words.filter(word=>text.includes(word)).length:0)};
       }).filter(item=>item.score>0).sort((a,b)=>b.score-a.score || b.memory.updated_at.localeCompare(a.memory.updated_at)).slice(0,6).map(item=>item.memory);
       const validEvidence=(memories:Memory[])=>[...new Set(memories.flatMap(memoryEvidenceIds))].filter(liveEvidence).map(id=>context.evidence.get(id)!);
-      let memories=ranked;
+      const usable=(memory:Memory)=>memory.content_status==='active' && validity.get(memory.id)?.status==='valid' && validity.get(memory.id)?.version===memory.version;
+      const groups=ranked.map(episode=>[episode,...[...context.memories.values()].filter(memory=>memory.kind==='response_need'
+        && memory.scope.kind==='episode' && memory.scope.id===episode.id && usable(memory))]);
+      for(const pattern of [...context.memories.values()].filter(memory=>memory.kind==='communication_pattern' && usable(memory))
+        .sort((a,b)=>b.updated_at.localeCompare(a.updated_at)).slice(0,4))groups.push([pattern]);
+      let memories=groups.flat();
+      for(const memory of memories)if(!states.has(memory.id))states.set(memory.id,'current');
       const create=(sources:MessageSnapshot[],end:number):ExtractionSnapshot=>({snapshot_version:1,job_id:lease.job_id,companion_id:this.#companion,
         timezone:context.timezone,user_actor_id:this.#config.companion.user.id,character_actor_id:this.#config.companion.character.id,epoch:this.#epoch(),
         first_sequence:input.sequence,created_at:this.#clock().toISOString(),watermark:{conversation_id:input.conversation_id,branch_id:input.branch_id,chain_revision:branch.chain_revision,sequence:end},
         sources:sources.map((source,i)=>({...source,id:`s${i+1}`})),memories,memory_states:Object.fromEntries(memories.map(memory=>[memory.id,states.get(memory.id)!])),evidence:validEvidence(memories)});
       let sources=eligible.filter(source=>source.ref.sequence===input.sequence),snapshot=create(sources,input.sequence);
-      while(measure(snapshot)>this.#config.deepseek.max_input_bytes && memories.length) {memories=memories.slice(0,-1);snapshot=create(sources,input.sequence);}
+      while(measure(snapshot)>this.#config.deepseek.max_input_bytes && groups.length) {groups.pop();memories=groups.flat();snapshot=create(sources,input.sequence);}
       requireState(sources.length<=128 && measure(snapshot)<=this.#config.deepseek.max_input_bytes,'BUDGET_EXCEEDED','The complete visible turn cannot fit the configured model input budget');
       const preceding=eligible.filter(source=>source.ref.sequence<input.sequence && source.ref.sequence>=input.sequence-2);
       if(preceding.length && preceding.length+sources.length<=128 && measure(create([...preceding,...sources],input.sequence))<=this.#config.deepseek.max_input_bytes) {

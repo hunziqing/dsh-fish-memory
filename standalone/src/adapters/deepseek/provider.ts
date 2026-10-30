@@ -17,7 +17,11 @@ const SYSTEM=`你是独立伴随记忆的后台整理器，只输出 json，不�
 每条新内容必须列出用户原话 evidence，source_id 只能选 sources 里给出的 ID；start/end 是 Unicode 码点半开区间，quote 须逐字匹配。原话尽量短。
 suppressed=true 的来源已被用户撤回，text 留空，仅保留链位置；不要尝试补全、恢复或作为证据。
 memory_states 中标为 needs_rebuild 的是失效记录身份壳，旧正文已隐藏。可沿用其 memory_id，但必须根据有效新原话和有效证据重新整理，不把占位概要当作用户事实。
-阶段四只整理经历和概要，不新建长期偏好，不输出未经实现的情绪解释字段。助手推测不作为用户事实。
+可给经历添加 interpretations：emotion、intent、response_need 分开保存；主体固定为用户。情绪明示/推断分开，user_confirmed 只用于用户明确表达或明确确认，推断保持 tentative/supported。助手推测不作为用户事实。
+每项解释引用本经历 evidence 的数组索引，并以 expressed_source_id 指向真正表达它的用户消息。felt_time 是当时感受的时间，不默认用记录时间；未知用 unknown。后来当前情绪不倒写为早先情绪。用户明确回顾过去时用 retrospective，并引用 retrospective_evidence_indices。
+修正先前误解时 replaces_id 指向其 ID，保留纠正链；真实情绪前后变化则新增时间各自独立的解释，不纠正过去真实感受。不能用推断覆盖已确认理解。response_need 只影响对应经历，后续需要建议时明确修订旧需要。
+patterns 仅用于长期交流习惯：一次“只想说说”不建长期模式；明确长期偏好须有“以后、每次、习惯”等长期范围的原话；observed_pattern 保留条件、不同会话证据和反例检查，两个独立会话以前只可 staged/tentative，重复不能变成 user_confirmed。反例不能丢弃；明确纠正已有偏好时修订同一 memory_id，不另建冲突规则。
+patterns.evidence 使用真实用户原话区间，existing_evidence_ids 只能引用输入 evidence 中有效条目，counterexample_evidence_ids 也必须真实存在；新的反例用 counterexample_evidence_indices 指向该 pattern.evidence 的数组索引。不要输出主性格字段，不根据语言习惯做心理诊断。没有长期偏好可省略 patterns。
 必要时把一个误合并事件拆成多个：旧记录改 disputed，新记录使用不同 local_id，以 links 关联；不能自动 retracted。
 没有需要记住的用户经历（例如纯问候）用 action=none，不能把格式错误或预算失败当作 none。
 输出示例：{"action":"patch","reason":"用户明确谈及加班","episodes":[{"local_id":"e1","memory_id":null,"summary":"用户谈起加班。","details":"","publication_status":"published","content_status":"active","topic_status":"ongoing","occurred":{"precision":"unknown","start":null,"end":null,"basis":"unknown","evidence_indices":[]},"evidence":[{"source_id":"s1","quote":"今天加班","start":0,"end":4}]}],"links":[]}
