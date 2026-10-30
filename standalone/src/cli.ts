@@ -42,7 +42,7 @@ export async function main(args=process.argv.slice(2)):Promise<void> {
   const {command,options}=parse(args),home=resolveHome(options.get('--home'));
   const token=resolve(options.get('--token-file')??join(home,'admin-token'));
   if(command==='mcp-stdio') {await serveBridge(home,resolve(options.get('--token-file')??join(home,'mcp-read-token')));return;}
-  if(command==='help') {print({commands:['init','serve','status','stop','configure-deepseek --enabled <true|false>','retry-job --job-id <id> --request-id <id>','mcp-stdio --token-file <read-token-file>','backup --out <new-directory>','restore --from <backup> --home <new-directory>','token-issue --capability <read|observe|user_edit|admin> --out <new-file>'],home_option:'--home <directory>',phase:4,mcp:true,model_worker:'explicitly-configured'});return;}
+  if(command==='help') {print({commands:['init','serve','status','stop','configure-deepseek --enabled <true|false>','retry-job --job-id <id> --request-id <id>','mcp-stdio --token-file <read-token-file>','backup --out <new-directory>','restore --from <backup> --home <new-directory>','token-issue --capability <read|observe|user_edit|admin> --out <new-file>'],home_option:'--home <directory>',phase:5,mcp:true,model_worker:'explicitly-configured'});return;}
   if(command==='restore') {const from=options.get('--from');requireState(from && options.has('--home'),'VALIDATION_ERROR','Restore requires --from and an explicit new --home');print({ok:true,...restoreBackup(from,home)});return;}
   if(command==='retry-job') {
     requireState(options.has('--job-id')&&options.has('--request-id'),'VALIDATION_ERROR','Retry needs a job ID and stable request ID');
@@ -66,7 +66,7 @@ export async function main(args=process.argv.slice(2)):Promise<void> {
     requireState(raw===undefined || /^\d+$/.test(raw),'VALIDATION_ERROR','Port must be an integer');
     const store=RuntimeStore.open(home,{initialize:true,init:{...(options.has('--user-name')?{user_name:options.get('--user-name')!}:{}),
       ...(options.has('--character-name')?{character_name:options.get('--character-name')!}:{}),port}});
-    try {print({ok:true,home:store.home,token_file:store.ensureBootstrapToken(),phase:4});} finally {store.close();}return;
+    try {print({ok:true,home:store.home,token_file:store.ensureBootstrapToken(),phase:5});} finally {store.close();}return;
   }
   const store=RuntimeStore.open(home);
   if(command==='serve') {

@@ -1,7 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import type { Memory } from '../domain/memory.ts';
 import type { ToolInput } from '../contracts/tools.ts';
-import type { ValidationContext } from '../contracts/validation.ts';
+import { messageKey,type ValidationContext } from '../contracts/validation.ts';
 import { allEvidence } from '../db/memory-writer.ts';
 import { conversationId } from '../db/context.ts';
 import { codePointLength, sliceCodePoints, type TimeRange } from '../domain/common.ts';
@@ -85,31 +85,50 @@ function overlaps(a:TimeRange,b:TimeRange,timezone:string):boolean {
   const x=Math.min(startA.length,endB.length),y=Math.min(startB.length,endA.length);
   return startA.slice(0,x)<=endB.slice(0,x) && startB.slice(0,y)<=endA.slice(0,y);
 }
-export function recallView(db:DatabaseSync,input:ToolInput<'recall_context'>,context:ValidationContext) {
+export function recallView(db:DatabaseSync,input:ToolInput<'recall_context'>,context:ValidationContext,now:Date=new Date()) {
   requireState(input.branch_id==='main','VALIDATION_ERROR','Only main is supported by this host boundary');
   const marks=watermarks(db,context.companion_id,input.conversation_id,input.branch_id);
   const queryTerms=terms(input.query+' '+input.recent_context.filter(item=>item.role==='user').map(item=>item.text).join(' '));
+  const topicScore=(memory:Extract<Memory,{kind:'episode'}>)=>{
+    const text=(memory.summary+' '+memory.details).toLocaleLowerCase('en');return queryTerms.reduce((sum,term)=>sum+Number(text.includes(term)),0);
+  };
+  const localNeed=(memory:Extract<Memory,{kind:'response_need'}>)=>{
+    const refs=memory.evidence_ids.flatMap(id=>{const e=context.evidence.get(id);return e?.source.kind==='message'
+      && context.actors.get(e.speaker_actor_id)?.kind==='user'?[e.source.ref]:[];})
+      .filter(ref=>ref.conversation_id===input.conversation_id && ref.branch_id===input.branch_id);
+    if(!marks.accepted_through || !refs.some(ref=>{
+      const source=context.messages.get(messageKey(ref)),gap=marks.accepted_through!.sequence-ref.sequence;
+      if(!source?.active || source.suppressed || source.role!=='user' || gap<0 || gap>6)return false;
+      const age=now.getTime()-Date.parse(source.captured_at);return age>=0 && age<=12*3600_000;
+    }))return 0;
+    if(memory.scope.kind==='conversation')return memory.scope.id===input.conversation_id?100:0;
+    const episode=context.memories.get(memory.scope.id);
+    if(episode?.kind!=='episode' || episode.topic_status==='closed' || !visible(db,context.companion_id,episode) || topicScore(episode)===0)return 0;
+    return 100;
+  };
   const ranked=[...context.memories.values()].filter(memory=>visible(db,context.companion_id,memory)).map(memory=>{
-    if(memory.kind==='response_need') return {memory,score:0}; // Scoped response planning is implemented in phase 5.
-    if(memory.kind==='communication_pattern') return {memory,score:memory.pattern_kind==='explicit_preference'?0.5:0};
+    if(memory.kind==='response_need') return {memory,score:localNeed(memory)};
+    if(memory.kind==='communication_pattern') {
+      const applicable=memory.conditions.length===0 || memory.conditions.every(condition=>terms(condition).some(term=>queryTerms.includes(term)));
+      return {memory,score:applicable?(memory.pattern_kind==='explicit_preference'?50:10):0};
+    }
     if(input.time_range && input.time_range.precision!=='unknown') {
       if(!overlaps(memory.occurred,input.time_range,context.timezone))return {memory,score:0};
     }
-    const text=(memory.summary+' '+memory.details).toLocaleLowerCase('en');
-    return {memory,score:queryTerms.reduce((sum,term)=>sum+Number(text.includes(term)),0)};
+    return {memory,score:topicScore(memory)};
   }).filter(item=>item.score>0).sort((a,b)=>b.score-a.score || b.memory.updated_at.localeCompare(a.memory.updated_at));
-  const items: {memory:Memory;evidence:ReturnType<typeof metadata>['evidence'];actors:ReturnType<typeof metadata>['actors'];historical:true;awakened:boolean;truncated:boolean;match_reasons:('topic'|'communication_preference')[]}[]=[];
+  const items: {memory:Memory;evidence:ReturnType<typeof metadata>['evidence'];actors:ReturnType<typeof metadata>['actors'];historical:true;awakened:boolean;truncated:boolean;match_reasons:('topic'|'related_event'|'communication_preference')[]}[]=[];
   let truncated=false,preferences=0;
   for(const {memory:stored} of ranked) {
     if(items.length>=input.max_items) {truncated=true;break;}
-    if(stored.kind==='communication_pattern' && preferences>=2) continue;
+    if(stored.kind!=='episode' && preferences>=2) continue;
     const memory=projection(stored);let meta:ReturnType<typeof metadata>;
     try {meta=metadata(memory,context);} catch(error) {if(error instanceof RuntimeError && error.code==='BUDGET_EXCEEDED'){truncated=true;continue;}throw error;}
     const item={memory,...meta,historical:true as const,awakened:false,truncated:false,
-      match_reasons:[memory.kind==='communication_pattern'?'communication_preference':'topic'] as ('topic'|'communication_preference')[]};
+      match_reasons:[memory.kind==='response_need'?'related_event':memory.kind==='communication_pattern'?'communication_preference':'topic'] as ('topic'|'related_event'|'communication_preference')[]};
     if(size([...items,item])>input.max_chars) item.truncated=true;
     if(!fit(item,memory,input.max_chars,()=>size([...items,item]))) {truncated=true;continue;}
-    items.push(item);truncated ||= item.truncated;if(stored.kind==='communication_pattern')preferences++;
+    items.push(item);truncated ||= item.truncated;if(stored.kind!=='episode')preferences++;
   }
   const warnings:('processing_pending'|'budget_truncated')[]=[];
   if(marks.accepted_through && marks.processed_through!.sequence<marks.accepted_through.sequence) warnings.push('processing_pending');

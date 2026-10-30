@@ -124,11 +124,11 @@ function checkScope(scope: {kind: string; id: string}, context: ValidationContex
     : extraIds.has(scope.id) || (context.memories.get(scope.id)?.kind === 'episode' && context.memories.get(scope.id)?.companion_id === context.companion_id);
   if (!valid) issue(issues, 'NOT_FOUND', path, 'Scope does not name an object of the required kind');
 }
-function checkPattern(value: PreferenceValue | Extract<Memory, {kind: 'communication_pattern'}> | ResponseNeedRecord, context: ValidationContext, issues: ContractIssue[], path: string): void {
+function checkPattern(value: PreferenceValue | Extract<Memory, {kind: 'communication_pattern'}> | ResponseNeedRecord, context: ValidationContext, issues: ContractIssue[], path: string,extraIds:ReadonlySet<string>=new Set()): void {
   if(new Set([...value.evidence_ids,...('counterexample_evidence_ids' in value?value.counterexample_evidence_ids:[])]).size>128)
     issue(issues,'BUDGET_EXCEEDED',path,'The complete evidence set exceeds the 128-item read contract');
   const evidence = referencedEvidence(value.evidence_ids, context, issues, `${path}.evidence_ids`);
-  checkScope(value.scope, context, issues, `${path}.scope`);
+  checkScope(value.scope, context, issues, `${path}.scope`,extraIds);
   if (('category' in value && value.category === 'response_need') || ('kind' in value && value.kind === 'response_need')) {
     if (!evidence.some(e => isDirectUserEvidence(e, context))) issue(issues, 'VALIDATION_ERROR', path, 'A response need cannot be inferred from assistant-only material');
     if (value.basis_kind === 'user_explicit' && !evidence.some(e => isDirectUserEvidence(e, context))) issue(issues, 'VALIDATION_ERROR', path, 'An explicit response need requires user evidence');
@@ -141,11 +141,14 @@ function checkPattern(value: PreferenceValue | Extract<Memory, {kind: 'communica
   if (value.pattern_kind === 'explicit_preference') {
     if (!evidence.some(e => isDirectUserEvidence(e, context))) issue(issues, 'VALIDATION_ERROR', path, 'An explicit preference requires direct user evidence');
   } else {
-    const contexts = new Set(evidence.map(e => e.source.kind === 'message' ? e.source.ref.conversation_id : `source:${e.source.source_id}`));
+    const contexts = new Set(evidence.filter(e=>isDirectUserEvidence(e,context)).map(e => e.source.kind === 'message' ? e.source.ref.conversation_id : `source:${e.source.source_id}`));
     const declared = new Set(value.independent_context_ids);
-    const ready = contexts.size >= 2 && declared.size >= 2 && [...declared].every(id => contexts.has(id))
+    const consistent=contexts.size>0 && declared.size===contexts.size && [...declared].every(id => contexts.has(id));
+    if(!consistent)issue(issues,'VALIDATION_ERROR',path,'Observed pattern contexts must match direct user evidence');
+    const ready = contexts.size >= 2 && consistent
       && value.conditions.length > 0 && value.counterexamples_reviewed;
-    if (!ready) issue(issues, 'VALIDATION_ERROR', path, 'An observed pattern needs independent contexts, conditions and counterexample review');
+    const draft='publication_status' in value && value.publication_status==='staged' && value.status==='tentative';
+    if (!ready && !draft) issue(issues, 'VALIDATION_ERROR', path, 'An observed pattern needs independent contexts, conditions and counterexample review');
     if (value.status === 'user_confirmed') issue(issues, 'VALIDATION_ERROR', path, 'Repeated observations are not user confirmation');
   }
   referencedEvidence(value.counterexample_evidence_ids, context, issues, `${path}.counterexamples`);
@@ -156,7 +159,7 @@ function checkMemory(memory: Memory, context: ValidationContext, issues: Contrac
   if (memory.companion_id !== context.companion_id) issue(issues, 'FORBIDDEN', memory.id, 'Cross-companion memory');
   if (Date.parse(memory.updated_at) < Date.parse(memory.created_at)) issue(issues, 'VALIDATION_ERROR', memory.id, 'Updated time precedes creation');
   referencedEvidence(memory.evidence_ids, context, issues, `${memory.id}.evidence_ids`);
-  if (memory.kind !== 'episode') { checkPattern(memory, context, issues, memory.id); return; }
+  if (memory.kind !== 'episode') { checkPattern(memory, context, issues, memory.id,extraIds); return; }
   if (!memory.summary.trim()) issue(issues, 'VALIDATION_ERROR', memory.id, 'Summary must contain text');
   checkTime(memory.occurred, `${memory.id}.occurred`, issues);
   referencedEvidence(memory.occurred.evidence_ids, context, issues, `${memory.id}.occurred.evidence_ids`);
@@ -305,7 +308,7 @@ function checkTargets(targets: readonly {memory_id: string; expected_version: nu
 }
 function checkMutations(targets: CandidatePatch['targets'], mutations: CandidatePatch['mutations'], context: ValidationContext, issues: ContractIssue[]): void {
   const targetMap = new Map(targets.map(target => [target.memory_id, target]));
-  const extraIds = new Set(mutations.filter(m => m.operation === 'create').map(m => m.record.id));
+  const extraIds = new Set(mutations.filter(m => m.operation === 'create' && m.record.kind==='episode').map(m => m.record.id));
   const touched = new Set<string>();
   for (const mutation of mutations) {
     if (touched.has(mutation.record.id)) issue(issues, 'VALIDATION_ERROR', 'mutations', 'Record is mutated more than once');
