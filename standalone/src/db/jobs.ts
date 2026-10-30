@@ -35,16 +35,30 @@ export class JobQueue {
       lease_token=NULL,lease_until=NULL,lease_generation=lease_generation+1,error_code='LEASE_EXPIRED',available_at=?
       WHERE companion_id=? AND status='running' AND lease_until<=?`).run(this.maxAttempts, now, this.companion, now);
     this.db.prepare(`UPDATE jobs SET status='queued' WHERE companion_id=? AND status='retry_wait' AND available_at<=?`).run(this.companion, now);
+    this.db.prepare(`UPDATE model_invocations SET status='interrupted',error_code='WORKER_INTERRUPTED' WHERE companion_id=? AND status='reserved'
+      AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id=model_invocations.job_id AND j.companion_id=model_invocations.companion_id
+        AND j.status='running' AND j.lease_generation=model_invocations.lease_generation AND j.lease_until>?)`).run(this.companion,now);
     return Number(expired.changes);
   }
   recover(): number { this.writable(); return transaction(this.db, () => this.recoverInTransaction()); }
-  claim(): JobLease | null {
+  claim(): JobLease | null {return this.claimMatching(false);}
+  claimExtraction():JobLease|null {return this.claimMatching(true);}
+  private claimMatching(extraction:boolean): JobLease | null {
     this.writable();
     return transaction(this.db, () => {
       this.recoverInTransaction();
       const now = this.clock().toISOString();
-      const row = this.db.prepare(`SELECT id,lease_generation,input_json FROM jobs WHERE companion_id=? AND status='queued' AND attempts<? AND available_at<=? ORDER BY rowid LIMIT 1`)
-        .get(this.companion, this.maxAttempts, now);
+      const row=extraction?this.db.prepare(`SELECT j.id,j.lease_generation,j.input_json FROM jobs j
+        JOIN turn_processing p ON p.job_id=j.id AND p.companion_id=j.companion_id JOIN turns t ON t.id=p.turn_id
+        JOIN branches b ON b.companion_id=p.companion_id AND b.conversation_id=p.conversation_id AND b.id=p.branch_id
+        WHERE j.companion_id=? AND j.kind='extract' AND j.status='queued' AND j.attempts<? AND j.available_at<=?
+          AND p.chain_revision=b.chain_revision AND t.sequence<=b.accepted_through
+          AND NOT EXISTS (SELECT 1 FROM turn_processing earlier JOIN turns et ON et.id=earlier.turn_id JOIN jobs ej ON ej.id=earlier.job_id
+            WHERE earlier.companion_id=p.companion_id AND earlier.conversation_id=p.conversation_id AND earlier.branch_id=p.branch_id
+              AND earlier.chain_revision=p.chain_revision AND et.sequence<t.sequence AND ej.status IN ('queued','running','retry_wait'))
+        ORDER BY t.sequence,j.rowid LIMIT 1`).get(this.companion,this.maxAttempts,now):
+        this.db.prepare(`SELECT id,lease_generation,input_json FROM jobs WHERE companion_id=? AND status='queued' AND attempts<? AND available_at<=? ORDER BY rowid LIMIT 1`)
+          .get(this.companion,this.maxAttempts,now);
       if (!row) return null;
       const token = randomUUID(); const generation = Number(row.lease_generation) + 1;
       const until = new Date(this.clock().getTime() + this.leaseMs).toISOString();
@@ -81,8 +95,16 @@ export class JobQueue {
       const row = this.db.prepare('SELECT attempts FROM jobs WHERE id=?').get(lease.job_id)!;
       const retry = retryable && Number(row.attempts) < this.maxAttempts;
       const available = new Date(this.clock().getTime() + Math.min(60000, 1000 * 2 ** Number(row.attempts))).toISOString();
+      this.db.prepare("UPDATE job_candidates SET status='stale' WHERE companion_id=? AND job_id=? AND lease_generation=? AND status='staged'").run(this.companion,lease.job_id,lease.generation);
       this.db.prepare('UPDATE jobs SET status=?,available_at=?,error_code=?,lease_token=NULL,lease_until=NULL WHERE companion_id=? AND id=?')
         .run(retry ? 'retry_wait' : 'failed', available, code.slice(0, 128), this.companion, lease.job_id);
+    });
+  }
+  deferWithoutCall(lease:JobLease,until:string,code:string):void {
+    this.writable();transaction(this.db,()=>{
+      this.assertLease(lease);
+      this.db.prepare(`UPDATE jobs SET status='retry_wait',available_at=?,attempts=max(0,attempts-1),error_code=?,
+        lease_token=NULL,lease_until=NULL,lease_generation=lease_generation+1 WHERE companion_id=? AND id=?`).run(until,code,this.companion,lease.job_id);
     });
   }
 }

@@ -16,6 +16,7 @@ export interface MessageSnapshot {
   role: 'user' | 'assistant'; text: string; captured_at: string;
   channel: 'visible' | 'injected'; active: boolean;
   suppressed?: boolean;
+  position?:number;
 }
 export interface SourceSnapshot {
   source_id: string; external_id: string; content_hash: string;
