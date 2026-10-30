@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { resolveHome, writeExclusive } from './config.ts';
+import { resolveHome, writeExclusive,saveConfig,DeepSeekConfigSchema } from './config.ts';
 import { createBackup, restoreBackup } from './runtime/backup.ts';
 import { RuntimeStore, type Capability } from './runtime/store.ts';
 import { RuntimeError, requireState } from './runtime/errors.ts';
@@ -16,7 +16,9 @@ function parse(args:string[]):{command:string;options:Map<string,string>} {
     options.set(key,value);
   }
   const allowed:Record<string,string[]>={help:[],init:['--home','--user-name','--character-name','--port'],serve:['--home'],status:['--home','--token-file'],stop:['--home','--token-file'],
-    backup:['--home','--token-file','--out'],restore:['--from','--home'],'token-issue':['--home','--capability','--out'],'mcp-stdio':['--home','--token-file']};
+    backup:['--home','--token-file','--out'],restore:['--from','--home'],'token-issue':['--home','--capability','--out'],'mcp-stdio':['--home','--token-file'],
+    'configure-deepseek':['--home','--enabled','--model','--api-key-env','--daily-calls','--daily-reserved-tokens','--max-input-bytes','--max-output-tokens'],
+    'retry-job':['--home','--token-file','--job-id','--request-id']};
   requireState(command in allowed && [...options.keys()].every(key=>allowed[command]!.includes(key)),'VALIDATION_ERROR','Unknown command or option');
   return {command,options};
 }
@@ -40,8 +42,12 @@ export async function main(args=process.argv.slice(2)):Promise<void> {
   const {command,options}=parse(args),home=resolveHome(options.get('--home'));
   const token=resolve(options.get('--token-file')??join(home,'admin-token'));
   if(command==='mcp-stdio') {await serveBridge(home,resolve(options.get('--token-file')??join(home,'mcp-read-token')));return;}
-  if(command==='help') {print({commands:['init','serve','status','stop','mcp-stdio --token-file <read-token-file>','backup --out <new-directory>','restore --from <backup> --home <new-directory>','token-issue --capability <read|observe|user_edit|admin> --out <new-file>'],home_option:'--home <directory>',phase:3,mcp:true,model_worker:false});return;}
+  if(command==='help') {print({commands:['init','serve','status','stop','configure-deepseek --enabled <true|false>','retry-job --job-id <id> --request-id <id>','mcp-stdio --token-file <read-token-file>','backup --out <new-directory>','restore --from <backup> --home <new-directory>','token-issue --capability <read|observe|user_edit|admin> --out <new-file>'],home_option:'--home <directory>',phase:4,mcp:true,model_worker:'explicitly-configured'});return;}
   if(command==='restore') {const from=options.get('--from');requireState(from && options.has('--home'),'VALIDATION_ERROR','Restore requires --from and an explicit new --home');print({ok:true,...restoreBackup(from,home)});return;}
+  if(command==='retry-job') {
+    requireState(options.has('--job-id')&&options.has('--request-id'),'VALIDATION_ERROR','Retry needs a job ID and stable request ID');
+    print(await request(home,token,'/admin/jobs/retry',{request_id:options.get('--request-id'),job_id:options.get('--job-id')}));return;
+  }
   if(command==='status' || command==='stop') {
     const result=await request(home,token,command==='status'?'/status':'/admin/shutdown',command==='stop'?{}:undefined);
     if(command==='stop') {
@@ -60,7 +66,7 @@ export async function main(args=process.argv.slice(2)):Promise<void> {
     requireState(raw===undefined || /^\d+$/.test(raw),'VALIDATION_ERROR','Port must be an integer');
     const store=RuntimeStore.open(home,{initialize:true,init:{...(options.has('--user-name')?{user_name:options.get('--user-name')!}:{}),
       ...(options.has('--character-name')?{character_name:options.get('--character-name')!}:{}),port}});
-    try {print({ok:true,home:store.home,token_file:store.ensureBootstrapToken(),phase:3});} finally {store.close();}return;
+    try {print({ok:true,home:store.home,token_file:store.ensureBootstrapToken(),phase:4});} finally {store.close();}return;
   }
   const store=RuntimeStore.open(home);
   if(command==='serve') {
@@ -71,6 +77,15 @@ export async function main(args=process.argv.slice(2)):Promise<void> {
     await service.closed;process.off('SIGINT',shutdown);process.off('SIGTERM',shutdown);return;
   }
   try {
+    if(command==='configure-deepseek') {
+      const enabled=options.get('--enabled');requireState(enabled===undefined || ['true','false'].includes(enabled),'VALIDATION_ERROR','Enabled must be true or false');
+      const values={...store.config.deepseek,...(enabled===undefined?{}:{enabled:enabled==='true'}),
+        ...(options.has('--model')?{model:options.get('--model')!}:{}),...(options.has('--api-key-env')?{api_key_env:options.get('--api-key-env')!}:{})};
+      for(const [flag,key] of [['--daily-calls','daily_calls'],['--daily-reserved-tokens','daily_reserved_tokens'],['--max-input-bytes','max_input_bytes'],['--max-output-tokens','max_output_tokens']] as const)
+        if(options.has(flag))values[key]=Number(options.get(flag));
+      const deepseek=DeepSeekConfigSchema.parse(values);saveConfig(store.home,{...store.config,deepseek});
+      print({ok:true,enabled:deepseek.enabled,model:deepseek.model,api_key_env:deepseek.api_key_env,restart_required:true});return;
+    }
     if(command==='backup') {print({ok:true,directory:await createBackup(store,resolve(options.get('--out')??join(home,'backups',`backup-${Date.now()}`)))});return;}
     if(command==='token-issue') {
       const capability=options.get('--capability'),out=options.get('--out');

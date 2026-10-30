@@ -1,10 +1,20 @@
 import * as z from 'zod';
 import { randomUUID } from 'node:crypto';
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, realpathSync, writeFileSync,renameSync,unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { HashSchema, IdSchema } from './domain/common.ts';
 import { RuntimeError } from './runtime/errors.ts';
+
+export const DeepSeekConfigSchema=z.strictObject({
+  enabled:z.boolean().default(false),model:z.string().regex(/^deepseek-[A-Za-z0-9._-]{1,80}$/).default('deepseek-flash'),
+  base_url:z.literal('https://api.deepseek.com').default('https://api.deepseek.com'),
+  api_key_env:z.string().regex(/^[A-Z_][A-Z0-9_]{0,63}$/).default('DEEPSEEK_API_KEY'),
+  timeout_ms:z.int().min(1000).max(120000).default(60000),max_output_tokens:z.int().min(512).max(16384).default(4096),
+  max_input_bytes:z.int().min(8192).max(262144).default(98304),daily_calls:z.int().min(1).max(10000).default(50),
+  daily_reserved_tokens:z.int().min(10000).max(100000000).default(1500000),window_turns:z.int().min(1).max(12).default(6),
+  poll_interval_ms:z.int().min(100).max(60000).default(1000),
+});
 
 export const ConfigSchema = z.strictObject({
   config_version: z.literal(1),
@@ -17,6 +27,7 @@ export const ConfigSchema = z.strictObject({
   server: z.strictObject({ host: z.literal('127.0.0.1'), port: z.int().min(0).max(65535), request_timeout_ms: z.int().min(1000).max(60000) }),
   database: z.strictObject({ busy_timeout_ms: z.int().min(0).max(10000) }),
   jobs: z.strictObject({ lease_ms: z.int().min(1000).max(300000), max_attempts: z.int().min(1).max(10) }),
+  deepseek:DeepSeekConfigSchema.default(()=>DeepSeekConfigSchema.parse({})),
 });
 export type RuntimeConfig = z.infer<typeof ConfigSchema>;
 export function resolveHome(explicit?: string): string {
@@ -45,6 +56,12 @@ export function readConfig(home: string): RuntimeConfig {
 export function writeExclusive(path: string, bytes: string | Uint8Array): void {
   const fd = openSync(path, 'wx', 0o600);
   try { writeFileSync(fd, bytes); fsyncSync(fd); } finally { closeSync(fd); }
+}
+export function saveConfig(home:string,value:unknown):RuntimeConfig {
+  const config=parseConfig(value),staging=join(home,`config-${randomUUID()}.tmp`);
+  writeExclusive(staging,JSON.stringify(config,null,2)+'\n');
+  try {renameSync(staging,join(home,'config.json'));} catch(error) {unlinkSync(staging);throw error;}
+  return config;
 }
 export function initializeConfig(home: string, options: { user_name?: string; character_name?: string; port?: number } = {}): RuntimeConfig {
   const path = join(home, 'config.json');

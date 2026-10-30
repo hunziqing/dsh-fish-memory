@@ -62,10 +62,10 @@ export class Observations {
         (SELECT d.id FROM search_documents d JOIN memory_validity v ON v.memory_id=d.memory_id WHERE v.status='stale')`).run(this.companion);
       this.db.prepare(`DELETE FROM search_documents WHERE companion_id=? AND memory_id IN (SELECT memory_id FROM memory_validity WHERE companion_id=? AND status='stale')`).run(this.companion,this.companion);
       this.db.prepare(`UPDATE job_candidates SET status='stale' WHERE companion_id=? AND status='staged' AND job_id IN
-        (SELECT job_id FROM turn_receipts WHERE companion_id=? AND conversation_id=? AND branch_id='main')`).run(this.companion,this.companion,conversation);
+        (SELECT job_id FROM turn_processing WHERE companion_id=? AND conversation_id=? AND branch_id='main')`).run(this.companion,this.companion,conversation);
       this.db.prepare(`UPDATE jobs SET status='stale',lease_generation=lease_generation+1,lease_token=NULL,lease_until=NULL,error_code='CHAIN_EDITED'
         WHERE companion_id=? AND status IN ('queued','running','retry_wait') AND id IN
-        (SELECT job_id FROM turn_receipts WHERE companion_id=? AND conversation_id=? AND branch_id='main')`).run(this.companion,this.companion,conversation);
+        (SELECT job_id FROM turn_processing WHERE companion_id=? AND conversation_id=? AND branch_id='main')`).run(this.companion,this.companion,conversation);
       this.db.prepare(`UPDATE branches SET chain_revision=?,accepted_through=0,processed_through=0 WHERE companion_id=? AND conversation_id=? AND id='main'`).run(input.chain_revision,this.companion,conversation);
     }
     if (!existing) this.db.prepare('INSERT INTO turns(id,companion_id,conversation_id,branch_id,sequence,external_id) VALUES(?,?,?,?,?,?)')
@@ -97,7 +97,7 @@ export class Observations {
       else this.schedule(input,conversation,turn);
     }
     const marks=this.refresh(input.conversation_id);
-    const receipt=this.db.prepare('SELECT j.id,j.status FROM turn_receipts r JOIN jobs j ON j.id=r.job_id WHERE r.companion_id=? AND r.conversation_id=? AND r.branch_id=? AND r.turn_id=? AND r.chain_revision=?')
+    const receipt=this.db.prepare('SELECT j.id,j.status FROM turn_processing r JOIN jobs j ON j.id=r.job_id WHERE r.companion_id=? AND r.conversation_id=? AND r.branch_id=? AND r.turn_id=? AND r.chain_revision=?')
       .get(this.companion,conversation,input.branch_id,turn,input.chain_revision)!;
     return {edited:changed,data:{receipt:'accepted',processing_status:marks.processed_through.sequence>=input.sequence?'processed':receipt.status==='failed'?'failed':'pending',
       duplicate,job_ids:[receipt.id as string],...marks}};
@@ -107,6 +107,7 @@ export class Observations {
     const normalized={...input,request_id:`observation-${hash}`};
     const job=this.queue.enqueueInTransaction('extract',hash,normalized);
     this.db.prepare('INSERT INTO turn_receipts VALUES(?,?,?,?,?,?,?)').run(this.companion,conversation,input.branch_id,turn,input.chain_revision,hash,job);
+    this.db.prepare('INSERT INTO turn_processing VALUES(?,?,?,?,?,?,1)').run(this.companion,conversation,input.branch_id,turn,input.chain_revision,job);
   }
   refresh(external: string): {accepted_through: Watermark; processed_through: Watermark} {
     requireState(this.db.isTransaction,'TRANSACTION_REQUIRED','Watermark updates require a transaction');
@@ -114,7 +115,9 @@ export class Observations {
     const branch=this.db.prepare(`SELECT chain_revision FROM branches WHERE companion_id=? AND conversation_id=? AND id='main'`).get(this.companion,conversation);
     requireState(branch,'NOT_FOUND','Conversation does not exist');
     const revision=Number(branch.chain_revision);
-    const rows=this.db.prepare(`SELECT t.sequence,j.status FROM turn_receipts r JOIN turns t ON t.id=r.turn_id JOIN jobs j ON j.id=r.job_id
+    const rows=this.db.prepare(`SELECT t.sequence,CASE WHEN j.status='cancelled' AND j.error_code='COALESCED' AND covering.status='completed' THEN 'completed' ELSE j.status END AS status
+      FROM turn_processing r JOIN turns t ON t.id=r.turn_id JOIN jobs j ON j.id=r.job_id
+      LEFT JOIN jobs covering ON covering.companion_id=j.companion_id AND covering.id=json_extract(j.result_json,'$.covered_by')
       WHERE r.companion_id=? AND r.conversation_id=? AND r.branch_id='main' AND r.chain_revision=?`).all(this.companion,conversation,revision)
       .map(row=>({sequence:Number(row.sequence),received:true,status:row.status as JobStatus}));
     const accepted=contiguousWatermark(rows,'accepted'); const processed=contiguousWatermark(rows,'processed');

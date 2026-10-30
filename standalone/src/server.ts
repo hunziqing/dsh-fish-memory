@@ -8,6 +8,8 @@ import { createBackup } from './runtime/backup.ts';
 import { RuntimeStore, type Capability } from './runtime/store.ts';
 import { RuntimeError, requireState } from './runtime/errors.ts';
 import { McpGateway } from './mcp/server.ts';
+import { startConfiguredWorker,type ExtractionWorker } from './workers/extraction-worker.ts';
+import type { ExtractionProvider } from './adapters/deepseek/provider.ts';
 
 export const ServiceFileSchema=z.strictObject({format:z.literal('fish-runtime-v1'),instance_id:z.uuid(),pid:z.int().positive(),host:z.literal('127.0.0.1'),port:z.int().min(1).max(65535)});
 export type ServiceFile=z.infer<typeof ServiceFileSchema>;
@@ -24,12 +26,13 @@ function send(response:ServerResponse,status:number,value:unknown):void {
   response.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff'});
   response.end(JSON.stringify(value));
 }
-export async function startServer(store:RuntimeStore) {
+export async function startServer(store:RuntimeStore,options:{extractionProvider?:ExtractionProvider}={}) {
   const instance_id=randomUUID(); let metadata:ServiceFile;
   let closing:Promise<void>|undefined; let resolveClosed:()=>void;
   const closed=new Promise<void>(resolve=>{resolveClosed=resolve;});
   const file=join(store.home,'service.json');
   const mcp=new McpGateway();
+  let worker:ExtractionWorker|null=null;
   const server=createServer((request,response)=>{
     request.setTimeout(store.config.server.request_timeout_ms,()=>request.destroy());
     void handle(request,response).catch(error=>{
@@ -46,7 +49,7 @@ export async function startServer(store:RuntimeStore) {
   async function handle(request:IncomingMessage,response:ServerResponse):Promise<void> {
     requireState(request.headers.host===`127.0.0.1:${metadata.port}` && request.headers.origin===undefined,'FORBIDDEN','Only direct local clients are accepted');
     const route=request.url??'';
-    if(request.method==='GET' && route==='/health') {send(response,200,{ok:true,phase:3,instance_id});return;}
+    if(request.method==='GET' && route==='/health') {send(response,200,{ok:true,phase:4,instance_id});return;}
     const auth=(capability:Capability|null)=>{
       const match=/^Bearer (fmc_[A-Za-z0-9_-]{43})$/.exec(request.headers.authorization??'');
       requireState(match,'FORBIDDEN','Bearer credential required'); return store.authenticate(match[1]!,capability).id;
@@ -54,6 +57,7 @@ export async function startServer(store:RuntimeStore) {
     if(route==='/mcp') {await mcp.handle(store,auth(null),request,response);return;}
     if(request.method==='POST' && route==='/host/evidence') {send(response,200,{ok:true,evidence:store.createUserEvidence(auth('user_edit'),await body(request))});return;}
     if(request.method==='GET' && route==='/status') {auth('read');send(response,200,{ok:true,instance_id,...store.status()});return;}
+    if(request.method==='POST' && route==='/admin/jobs/retry') {send(response,200,{ok:true,...store.retryFailedJob(auth('admin'),await body(request))});return;}
     if(request.method==='POST' && route==='/observe') {const principal=auth('observe');send(response,200,{ok:true,...store.observe(principal,await body(request))});return;}
     if(request.method==='GET' && /^\/memory\/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(route)) {
       const principal=auth('read');send(response,200,{ok:true,value:store.readMemory(principal,route.slice('/memory/'.length))});return;
@@ -73,7 +77,7 @@ export async function startServer(store:RuntimeStore) {
     closing=(async()=>{
       const httpClosed=new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve()));
       let failure:unknown;
-      const results=await Promise.allSettled([httpClosed,mcp.close()]);
+      const results=await Promise.allSettled([httpClosed,mcp.close(),worker?.stop()]);
       const rejected=results.find(result=>result.status==='rejected');if(rejected?.status==='rejected')failure=rejected.reason;
         try {
           if(existsSync(file) && JSON.parse(readFileSync(file,'utf8')).instance_id===instance_id) unlinkSync(file);
@@ -91,6 +95,7 @@ export async function startServer(store:RuntimeStore) {
     const address=server.address();requireState(address && typeof address==='object','INTERNAL_ERROR','Service did not bind');
     metadata={format:'fish-runtime-v1',instance_id,pid:process.pid,host:'127.0.0.1',port:address.port};
     const staging=join(store.home,`service-${instance_id}.tmp`);writeExclusive(staging,JSON.stringify(metadata)+'\n');renameSync(staging,file);
+    worker=startConfiguredWorker(store,options.extractionProvider);
   } catch(error) {if(server.listening) await close();else store.close();throw error;}
   return {metadata,closed,close};
 }

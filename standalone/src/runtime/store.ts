@@ -8,12 +8,14 @@ import { canonicalJson, hashJson, sha256Bytes } from '../contracts/canonical.ts'
 import { CandidatePatchSchema, type CandidatePatch, type Memory } from '../domain/memory.ts';
 import { ObserveInputSchema, toolContracts, ErrorCodeSchema, type ObserveData, type ToolName, type ToolInput, type ToolOutput } from '../contracts/tools.ts';
 import { validateCandidate, validateToolInput, validateToolOutput, messageKey, type ValidationContext, type ContractResult } from '../contracts/validation.ts';
-import { MessageRefSchema, sliceCodePoints, codePointLength } from '../domain/common.ts';
+import { MessageRefSchema, IdSchema, sliceCodePoints, codePointLength } from '../domain/common.ts';
 import { recallView, episodeView } from '../services/read-views.ts';
 import { writeTool } from '../services/tool-writes.ts';
 import { acquireOwner, openDatabase, transaction } from '../db/connection.ts';
 import { currentMemory, loadContext, storedId } from '../db/context.ts';
 import { JobQueue, type JobLease } from '../db/jobs.ts';
+import { ExtractionRepository } from '../db/extraction.ts';
+import type { ExtractionSnapshot } from '../adapters/deepseek/proposal.ts';
 import { Observations } from '../db/observations.ts';
 import { persistPatch, type CommitResult } from '../db/memory-writer.ts';
 import { putJson, readJson } from '../db/objects.ts';
@@ -21,6 +23,7 @@ import { RuntimeError, requireState } from './errors.ts';
 
 export type Capability = 'read' | 'observe' | 'user_edit' | 'admin';
 export interface Principal { id: string; companion_id: string; capability: Capability; }
+export interface WorkerState {enabled:boolean;busy:boolean;last_error:string|null;last_job_id:string|null;}
 export interface StoreOptions {
   initialize?: boolean;
   init?: {user_name?: string; character_name?: string; port?: number};
@@ -31,12 +34,15 @@ export class RuntimeStore {
   readonly home: string; readonly config: RuntimeConfig; readonly jobs: JobQueue;
   readonly #db: DatabaseSync; readonly #releaseOwner: () => void; readonly #clock: () => Date;
   readonly #observations: Observations; readonly #fault: (point:string)=>void;
+  readonly #extraction:ExtractionRepository;
+  #workerState:WorkerState={enabled:false,busy:false,last_error:null,last_job_id:null};
   #closed=false; #maintenance=false;
   private constructor(home:string,config:RuntimeConfig,db:DatabaseSync,release:()=>void,options:StoreOptions) {
     this.home=home; this.config=config; this.#db=db; this.#releaseOwner=release;
     this.#clock=options.clock??(()=>new Date()); this.#fault=options.fault??(()=>{});
     this.jobs=new JobQueue(db,config.companion.id,this.#clock,config.jobs.max_attempts,config.jobs.lease_ms,()=>this.assertWritable());
     this.#observations=new Observations(db,config,this.jobs);
+    this.#extraction=new ExtractionRepository(db,config,this.jobs,this.#observations,this.#clock);
   }
   static open(home:string,options:StoreOptions={}): RuntimeStore {
     if (!options.initialize) readConfig(home);
@@ -205,12 +211,16 @@ export class RuntimeStore {
   saveCandidate(lease:JobLease,raw:unknown): void {
     this.assertWritable();
     transaction(this.#db,()=>{
-      this.jobs.assertLease(lease); const input=this.#observations.assertJobInputCurrent(lease.input);
+      this.jobs.assertLease(lease); const input=this.#observations.assertJobInputCurrent(lease.input),snapshot=this.#extraction.assertCurrent(lease);
       const context=loadContext(this.#db,this.companion,new Set(['candidate']));
       const patch=this.checked(validateCandidate(raw,context));
       requireState(patch.job_id===lease.job_id && patch.input_watermark.conversation_id===input.conversation_id
         && patch.input_watermark.branch_id===input.branch_id && patch.input_watermark.chain_revision===input.chain_revision
-        && patch.input_watermark.sequence===input.sequence,'STALE_INPUT','Candidate belongs to another job input');
+        && patch.input_watermark.sequence===(snapshot?.watermark.sequence??input.sequence),'STALE_INPUT','Candidate belongs to another job input');
+      if(snapshot) {
+        const expected=new Set(snapshot.sources.map(source=>messageKey(source.ref)));
+        requireState(patch.input_messages.length===expected.size && patch.input_messages.every(ref=>expected.has(messageKey(ref))),'STALE_INPUT','Candidate input references differ from the captured model context');
+      }
       for(const mutation of patch.mutations) requireState(mutation.record.content_status!=='retracted','VALIDATION_ERROR','Automatic candidates cannot withdraw sources; use the user retract tool');
       for (const mutation of patch.mutations) if (mutation.record.kind==='episode') {
         const previous=context.memories.get(mutation.record.id);
@@ -224,13 +234,14 @@ export class RuntimeStore {
   commitCandidate(lease:JobLease): CommitResult {
     this.assertWritable();
     return transaction(this.#db,()=>{
-      this.jobs.assertLease(lease); const input=this.#observations.assertJobInputCurrent(lease.input);
+      this.jobs.assertLease(lease); const input=this.#observations.assertJobInputCurrent(lease.input),snapshot=this.#extraction.assertCurrent(lease);
       const staged=this.#db.prepare(`SELECT content_object_id FROM job_candidates WHERE companion_id=? AND job_id=? AND lease_generation=? AND status='staged'`).get(this.companion,lease.job_id,lease.generation);
       requireState(staged,'NOT_FOUND','No staged candidate exists for this worker lease');
       const raw=CandidatePatchSchema.parse(readJson(this.#db,this.companion,staged.content_object_id as string));
       const patch=this.checked(validateCandidate(raw,loadContext(this.#db,this.companion,new Set(['candidate']))));
       const result=persistPatch(this.#db,this.companion,patch,this.#clock().toISOString(),this.#fault);
       this.jobs.finishInTransaction(lease,result);
+      this.#extraction.finishCoverage(lease,snapshot);
       this.#db.prepare(`UPDATE job_candidates SET status='committed' WHERE companion_id=? AND job_id=? AND lease_generation=?`).run(this.companion,lease.job_id,lease.generation);
       this.#observations.refresh(input.conversation_id);
       this.#fault('beforeCommit');
@@ -241,20 +252,35 @@ export class RuntimeStore {
     this.assertWritable();
     transaction(this.#db,()=>{
       this.jobs.assertLease(lease);
-      const input=this.#observations.assertJobInputCurrent(lease.input);
+      const input=this.#observations.assertJobInputCurrent(lease.input),snapshot=this.#extraction.assertCurrent(lease);
       requireState(!this.#db.prepare(`SELECT 1 FROM job_candidates WHERE companion_id=? AND job_id=? AND lease_generation=? AND status='staged'`).get(this.companion,lease.job_id,lease.generation),
         'CANDIDATE_EXISTS','A staged patch must be committed or the job explicitly failed; it cannot be silently discarded as no-change');
       this.jobs.finishInTransaction(lease,{no_change:true});
+      this.#extraction.finishCoverage(lease,snapshot);
       this.#observations.refresh(input.conversation_id);
     });
   }
+  captureExtraction(lease:JobLease,measure:(snapshot:ExtractionSnapshot)=>number):ExtractionSnapshot {
+    this.assertWritable();return this.#extraction.capture(lease,measure);
+  }
+  reserveModelCall(lease:JobLease,bytes:number):string {this.assertWritable();return this.#extraction.reserve(lease,bytes);}
+  nextModelBudgetWindow():string {return this.#extraction.nextBudgetWindow();}
+  finishModelCall(id:string,success:boolean,usage:{prompt_tokens:number;completion_tokens:number}|null,error:string|null):void {
+    this.assertWritable();this.#extraction.finishInvocation(id,success,usage,error);
+  }
+  retryFailedJob(principal:string,raw:unknown) {
+    const input=z.strictObject({request_id:IdSchema,job_id:IdSchema}).parse(raw);
+    return this.idempotent(principal,'admin','retry_failed_job',input.request_id,input,()=>this.#extraction.retryFailed(input.job_id)).value;
+  }
+  setWorkerState(state:Partial<WorkerState>):void {this.#workerState={...this.#workerState,...state};}
   status(): Record<string,unknown> {
     const count=(table:string)=>Number(this.#db.prepare(`SELECT count(*) AS n FROM ${table}`).get()!.n);
-    return {phase:3,mcp_available:true,model_worker_enabled:false,companion_id:this.companion,
+    return {phase:4,mcp_available:true,model_worker_enabled:this.#workerState.enabled,worker_status:{...this.#workerState},companion_id:this.companion,
       schema_version:this.#db.prepare('SELECT max(version) AS n FROM schema_migrations').get()!.n,
       journal_mode:this.#db.prepare('PRAGMA journal_mode').get()!.journal_mode,
       messages:count('turn_versions'),memories:count('memory_records'),receipts:count('write_requests'),
       jobs:this.#db.prepare('SELECT status,count(*) AS count FROM jobs GROUP BY status').all(),
+      model_calls:this.#db.prepare('SELECT budget_day,status,count(*) AS count,coalesce(sum(reserved_tokens),0) AS reserved_tokens,coalesce(sum(prompt_tokens),0) AS prompt_tokens,coalesce(sum(completion_tokens),0) AS completion_tokens FROM model_invocations GROUP BY budget_day,status ORDER BY budget_day DESC LIMIT 32').all(),
       branches:this.#db.prepare('SELECT c.external_id AS conversation_id,b.id AS branch_id,b.chain_revision,b.accepted_through,b.processed_through FROM branches b JOIN conversations c ON c.id=b.conversation_id').all()};
   }
   // Used by the backup module, not exposed as arbitrary SQL over HTTP.
