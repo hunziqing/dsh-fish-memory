@@ -4,11 +4,13 @@
 
 该方案面向一个用户和一个由 DeepSeek 驱动的角色。独立服务通过 MCP 接入角色聊天程序，保存用户经历与交流习惯，支持持续修订、尘封压缩和自动唤醒。角色主设定与主记忆由原聊天程序管理。
 
-完整方案描述目标设计与分阶段实施约束。阶段一契约及合成样本已建立，阶段二已实现独立 CLI、本机管理服务、真实 SQLite、事务、幂等、持久任务和备份恢复基础。MCP 连接、DeepSeek 整理及归档唤醒尚未实现。
+完整方案描述目标设计与分阶段实施约束。阶段一契约、阶段二持久运行和阶段三 MCP 已实现，支持六工具、HTTP/stdio 与自有聊天调用边界。DeepSeek 自动整理、归档唤醒和独立聊天页面仍按后续阶段推进。
 
 - [阶段一契约与验收](../standalone/docs/阶段一契约与验收.md)
 - [阶段二运行与验收](../standalone/docs/阶段二运行与验收.md)
+- [阶段三 MCP 与聊天边界](../standalone/docs/阶段三MCP与聊天边界.md)
 - [实施进度与恢复](./实施进度与恢复.md)
+- [MemLikeHuman 长期记忆参考研究](./参考研究-memlikehuman.md)
 - [契约包与检查命令](../standalone/README.md)
 - [生成的 JSON Schema](../standalone/contracts/schema-bundle.json)
 - [合成对话样本](../standalone/fixtures/conversations.generated.json)

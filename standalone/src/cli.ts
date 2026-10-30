@@ -6,6 +6,7 @@ import { createBackup, restoreBackup } from './runtime/backup.ts';
 import { RuntimeStore, type Capability } from './runtime/store.ts';
 import { RuntimeError, requireState } from './runtime/errors.ts';
 import { ServiceFileSchema, startServer } from './server.ts';
+import { serveBridge } from './mcp/stdio-bridge.ts';
 
 function parse(args:string[]):{command:string;options:Map<string,string>} {
   const command=args[0]??'help'; const options=new Map<string,string>();
@@ -15,7 +16,7 @@ function parse(args:string[]):{command:string;options:Map<string,string>} {
     options.set(key,value);
   }
   const allowed:Record<string,string[]>={help:[],init:['--home','--user-name','--character-name','--port'],serve:['--home'],status:['--home','--token-file'],stop:['--home','--token-file'],
-    backup:['--home','--token-file','--out'],restore:['--from','--home'],'token-issue':['--home','--capability','--out']};
+    backup:['--home','--token-file','--out'],restore:['--from','--home'],'token-issue':['--home','--capability','--out'],'mcp-stdio':['--home','--token-file']};
   requireState(command in allowed && [...options.keys()].every(key=>allowed[command]!.includes(key)),'VALIDATION_ERROR','Unknown command or option');
   return {command,options};
 }
@@ -38,7 +39,8 @@ async function request(home:string,tokenFile:string,route:string,value?:unknown)
 export async function main(args=process.argv.slice(2)):Promise<void> {
   const {command,options}=parse(args),home=resolveHome(options.get('--home'));
   const token=resolve(options.get('--token-file')??join(home,'admin-token'));
-  if(command==='help') {print({commands:['init','serve','status','stop','backup --out <new-directory>','restore --from <backup> --home <new-directory>','token-issue --capability <read|observe|user_edit|admin> --out <new-file>'],home_option:'--home <directory>',phase:2,mcp:false,model_worker:false});return;}
+  if(command==='mcp-stdio') {await serveBridge(home,resolve(options.get('--token-file')??join(home,'mcp-read-token')));return;}
+  if(command==='help') {print({commands:['init','serve','status','stop','mcp-stdio --token-file <read-token-file>','backup --out <new-directory>','restore --from <backup> --home <new-directory>','token-issue --capability <read|observe|user_edit|admin> --out <new-file>'],home_option:'--home <directory>',phase:3,mcp:true,model_worker:false});return;}
   if(command==='restore') {const from=options.get('--from');requireState(from && options.has('--home'),'VALIDATION_ERROR','Restore requires --from and an explicit new --home');print({ok:true,...restoreBackup(from,home)});return;}
   if(command==='status' || command==='stop') {
     const result=await request(home,token,command==='status'?'/status':'/admin/shutdown',command==='stop'?{}:undefined);
@@ -58,7 +60,7 @@ export async function main(args=process.argv.slice(2)):Promise<void> {
     requireState(raw===undefined || /^\d+$/.test(raw),'VALIDATION_ERROR','Port must be an integer');
     const store=RuntimeStore.open(home,{initialize:true,init:{...(options.has('--user-name')?{user_name:options.get('--user-name')!}:{}),
       ...(options.has('--character-name')?{character_name:options.get('--character-name')!}:{}),port}});
-    try {print({ok:true,home:store.home,token_file:store.ensureBootstrapToken(),phase:2});} finally {store.close();}return;
+    try {print({ok:true,home:store.home,token_file:store.ensureBootstrapToken(),phase:3});} finally {store.close();}return;
   }
   const store=RuntimeStore.open(home);
   if(command==='serve') {

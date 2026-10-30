@@ -13,14 +13,15 @@ const code=(expected:string)=>(error:unknown)=>error instanceof RuntimeError && 
 test('stage 1 migration remains unchanged while runtime migration is transactional and repeatable',t=>{
   const path=join(temporary(t),'migration.sqlite');
   const db=openDatabase(path); track(t,()=>db.close());
-  assert.equal(db.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n,2);
+  const planned=migrations();
+  assert.equal(db.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n,planned.length);
   migrate(db);
-  assert.equal(db.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n,2);
-  const version3={version:3,name:'deliberate-failure',sql:'CREATE TABLE interrupted(id TEXT); INSERT INTO table_does_not_exist VALUES(1);'};
-  assert.throws(()=>migrate(db,[...migrations(),version3]));
+  assert.equal(db.prepare('SELECT count(*) AS n FROM schema_migrations').get()!.n,planned.length);
+  const broken={version:planned.length+1,name:'deliberate-failure',sql:'CREATE TABLE interrupted(id TEXT); INSERT INTO table_does_not_exist VALUES(1);'};
+  assert.throws(()=>migrate(db,[...planned,broken]));
   assert.equal(db.prepare("SELECT count(*) AS n FROM sqlite_master WHERE name='interrupted'").get()!.n,0);
-  assert.equal(db.prepare('SELECT max(version) AS n FROM schema_migrations').get()!.n,2);
-  assert.throws(()=>migrate(db,[{...migrations()[0]!,sql:migrations()[0]!.sql+'\n-- changed'},migrations()[1]!]),code('MIGRATION_MISMATCH'));
+  assert.equal(db.prepare('SELECT max(version) AS n FROM schema_migrations').get()!.n,planned.length);
+  assert.throws(()=>migrate(db,[{...planned[0]!,sql:planned[0]!.sql+'\n-- changed'},...planned.slice(1)]),code('MIGRATION_MISMATCH'));
 });
 
 test('file database uses WAL and a directory has exactly one cooperating writer',t=>{

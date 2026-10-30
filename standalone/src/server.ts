@@ -7,6 +7,7 @@ import { writeExclusive } from './config.ts';
 import { createBackup } from './runtime/backup.ts';
 import { RuntimeStore, type Capability } from './runtime/store.ts';
 import { RuntimeError, requireState } from './runtime/errors.ts';
+import { McpGateway } from './mcp/server.ts';
 
 export const ServiceFileSchema=z.strictObject({format:z.literal('fish-runtime-v1'),instance_id:z.uuid(),pid:z.int().positive(),host:z.literal('127.0.0.1'),port:z.int().min(1).max(65535)});
 export type ServiceFile=z.infer<typeof ServiceFileSchema>;
@@ -28,6 +29,7 @@ export async function startServer(store:RuntimeStore) {
   let closing:Promise<void>|undefined; let resolveClosed:()=>void;
   const closed=new Promise<void>(resolve=>{resolveClosed=resolve;});
   const file=join(store.home,'service.json');
+  const mcp=new McpGateway();
   const server=createServer((request,response)=>{
     request.setTimeout(store.config.server.request_timeout_ms,()=>request.destroy());
     void handle(request,response).catch(error=>{
@@ -44,11 +46,13 @@ export async function startServer(store:RuntimeStore) {
   async function handle(request:IncomingMessage,response:ServerResponse):Promise<void> {
     requireState(request.headers.host===`127.0.0.1:${metadata.port}` && request.headers.origin===undefined,'FORBIDDEN','Only direct local clients are accepted');
     const route=request.url??'';
-    if(request.method==='GET' && route==='/health') {send(response,200,{ok:true,phase:2,instance_id});return;}
-    const auth=(capability:Capability)=>{
+    if(request.method==='GET' && route==='/health') {send(response,200,{ok:true,phase:3,instance_id});return;}
+    const auth=(capability:Capability|null)=>{
       const match=/^Bearer (fmc_[A-Za-z0-9_-]{43})$/.exec(request.headers.authorization??'');
       requireState(match,'FORBIDDEN','Bearer credential required'); return store.authenticate(match[1]!,capability).id;
     };
+    if(route==='/mcp') {await mcp.handle(store,auth(null),request,response);return;}
+    if(request.method==='POST' && route==='/host/evidence') {send(response,200,{ok:true,evidence:store.createUserEvidence(auth('user_edit'),await body(request))});return;}
     if(request.method==='GET' && route==='/status') {auth('read');send(response,200,{ok:true,instance_id,...store.status()});return;}
     if(request.method==='POST' && route==='/observe') {const principal=auth('observe');send(response,200,{ok:true,...store.observe(principal,await body(request))});return;}
     if(request.method==='GET' && /^\/memory\/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(route)) {
@@ -62,21 +66,22 @@ export async function startServer(store:RuntimeStore) {
     if(request.method==='POST' && route==='/admin/shutdown') {
       auth('admin'); z.strictObject({}).parse(await body(request));send(response,200,{ok:true,stopping:true});void close();return;
     }
-    throw new RuntimeError('NOT_FOUND','Unknown phase 2 management route');
+    throw new RuntimeError('NOT_FOUND','Unknown management route');
   }
   function close():Promise<void> {
     if(closing) return closing;
-    closing=new Promise<void>((resolve,reject)=>{
-      server.close(error=>{
-        let failure:unknown=error;
+    closing=(async()=>{
+      const httpClosed=new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve()));
+      let failure:unknown;
+      const results=await Promise.allSettled([httpClosed,mcp.close()]);
+      const rejected=results.find(result=>result.status==='rejected');if(rejected?.status==='rejected')failure=rejected.reason;
         try {
           if(existsSync(file) && JSON.parse(readFileSync(file,'utf8')).instance_id===instance_id) unlinkSync(file);
         } catch {process.stderr.write(JSON.stringify({event:'shutdown_warning',code:'METADATA_CLEANUP_FAILED'})+'\n');}
         try {store.close();} catch(closeError) {failure=closeError;}
         resolveClosed();
-        if(failure) reject(failure); else resolve();
-      });
-    });
+        if(failure) throw failure;
+    })();
     return closing;
   }
   try {

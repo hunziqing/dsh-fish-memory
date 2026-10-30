@@ -3,7 +3,7 @@ import {
   codePointLength, sliceCodePoints, type MessageRef, type TimeRange,
 } from '../domain/common.ts';
 import {
-  CandidatePatchSchema, MemorySchema, type Actor, type CandidatePatch,
+  CandidatePatchSchema, MemorySchema, memoryEvidenceIds, type Actor, type CandidatePatch,
   type Evidence, type Memory, type PreferenceValue, type ResponseNeedRecord,
 } from '../domain/memory.ts';
 import { ArchiveManifestSchema, type ArchiveManifest } from './archive.ts';
@@ -15,6 +15,7 @@ export interface MessageSnapshot {
   ref: MessageRef; companion_id: string; actor_id: string;
   role: 'user' | 'assistant'; text: string; captured_at: string;
   channel: 'visible' | 'injected'; active: boolean;
+  suppressed?: boolean;
 }
 export interface SourceSnapshot {
   source_id: string; external_id: string; content_hash: string;
@@ -82,6 +83,7 @@ function checkEvidence(evidence: Evidence, context: ValidationContext, path: str
   let actor: string | undefined;
   if (evidence.source.kind === 'message') {
     const snapshot = checkMessage(evidence.source.ref, context, `${path}.source`, issues);
+    if(snapshot?.suppressed) issue(issues,'STALE_INPUT',path,'This source was withdrawn from memory use');
     text = snapshot?.text; actor = snapshot?.actor_id;
   } else {
     const snapshot = context.sources.get(sourceKey(evidence.source));
@@ -122,6 +124,8 @@ function checkScope(scope: {kind: string; id: string}, context: ValidationContex
   if (!valid) issue(issues, 'NOT_FOUND', path, 'Scope does not name an object of the required kind');
 }
 function checkPattern(value: PreferenceValue | Extract<Memory, {kind: 'communication_pattern'}> | ResponseNeedRecord, context: ValidationContext, issues: ContractIssue[], path: string): void {
+  if(new Set([...value.evidence_ids,...('counterexample_evidence_ids' in value?value.counterexample_evidence_ids:[])]).size>128)
+    issue(issues,'BUDGET_EXCEEDED',path,'The complete evidence set exceeds the 128-item read contract');
   const evidence = referencedEvidence(value.evidence_ids, context, issues, `${path}.evidence_ids`);
   checkScope(value.scope, context, issues, `${path}.scope`);
   if (('category' in value && value.category === 'response_need') || ('kind' in value && value.kind === 'response_need')) {
@@ -147,6 +151,7 @@ function checkPattern(value: PreferenceValue | Extract<Memory, {kind: 'communica
 }
 
 function checkMemory(memory: Memory, context: ValidationContext, issues: ContractIssue[], extraIds: ReadonlySet<string> = new Set()): void {
+  if(memoryEvidenceIds(memory).length>128) issue(issues,'BUDGET_EXCEEDED',memory.id,'The complete evidence set exceeds the 128-item read contract');
   if (memory.companion_id !== context.companion_id) issue(issues, 'FORBIDDEN', memory.id, 'Cross-companion memory');
   if (Date.parse(memory.updated_at) < Date.parse(memory.created_at)) issue(issues, 'VALIDATION_ERROR', memory.id, 'Updated time precedes creation');
   referencedEvidence(memory.evidence_ids, context, issues, `${memory.id}.evidence_ids`);

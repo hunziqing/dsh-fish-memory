@@ -43,8 +43,9 @@ export function loadContext(db: DatabaseSync, companion: string, capabilities: V
       branch_id: row.id as string, chain_revision: Number(row.chain_revision), turns: new Map()});
   }
   const messages = new Map<string, MessageSnapshot>();
+  const suppressed=new Set(db.prepare('SELECT message_id FROM message_suppressions WHERE companion_id=?').all(companion).map(row=>row.message_id));
   for (const row of db.prepare(`SELECT b.branch_id,c.external_id AS conversation_external,t.sequence,COALESCE(t.external_id,t.id) AS turn_external,
-      COALESCE(m.external_id,m.id) AS message_external,m.role,m.actor_id,v.revision,v.content_object_id,v.captured_at
+      COALESCE(m.external_id,m.id) AS message_external,m.id AS logical_message_id,m.role,m.actor_id,v.revision,v.content_object_id,v.captured_at
     FROM branch_messages b JOIN messages m ON m.id=b.message_id JOIN turn_versions v ON v.id=b.turn_version_id
     JOIN turns t ON t.id=m.turn_id JOIN conversations c ON c.id=t.conversation_id WHERE b.companion_id=? AND b.active=1`).all(companion)) {
     const payload = readJson(db, companion, row.content_object_id as string) as {text?: unknown};
@@ -52,7 +53,8 @@ export function loadContext(db: DatabaseSync, companion: string, capabilities: V
     const ref: MessageRef = {conversation_id: row.conversation_external as string, branch_id: row.branch_id as string,
       turn_id: row.turn_external as string, sequence: Number(row.sequence), message_id: row.message_external as string, revision: Number(row.revision)};
     const snapshot: MessageSnapshot = {ref, companion_id: companion, actor_id: row.actor_id as string,
-      role: row.role as 'user' | 'assistant', text: payload.text, captured_at: row.captured_at as string, channel: 'visible', active: true};
+      role: row.role as 'user' | 'assistant', text: payload.text, captured_at: row.captured_at as string, channel: 'visible', active: true,
+      suppressed:suppressed.has(row.logical_message_id)};
     messages.set(messageKey(ref), snapshot);
     branches.get(branchKey(ref.conversation_id,ref.branch_id))?.turns.set(ref.sequence,ref.turn_id);
   }
