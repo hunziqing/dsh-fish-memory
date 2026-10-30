@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
-import type { CandidatePatch, Evidence, Memory } from '../domain/memory.ts';
+import { memoryEvidenceIds as allEvidence, type CandidatePatch, type Memory } from '../domain/memory.ts';
+export { memoryEvidenceIds as allEvidence } from '../domain/memory.ts';
 import { hashJson, canonicalJson } from '../contracts/canonical.ts';
 import { requireState } from '../runtime/errors.ts';
 import { conversationId, currentMemory, messageVersionId, storedId } from './context.ts';
@@ -10,13 +11,6 @@ export interface CommitResult {
   committed: true;
   changed: {memory_id: string; version: number; suppression_generation: number}[];
   created: {temporary_id: string; memory_id: string; version: 1}[];
-}
-function allEvidence(memory: Memory): string[] {
-  const ids = [...memory.evidence_ids];
-  if (memory.kind === 'episode') ids.push(...memory.occurred.evidence_ids,
-    ...memory.interpretations.flatMap(item => [...item.evidence_ids, ...item.felt_time.evidence_ids, ...item.retrospective_evidence_ids]));
-  if (memory.kind === 'communication_pattern') ids.push(...memory.counterexample_evidence_ids);
-  return [...new Set(ids)];
 }
 function remap(memory: Memory, ids: Map<string,string>, now: string, created: boolean): Memory {
   const next = structuredClone(memory);
@@ -31,8 +25,12 @@ function remap(memory: Memory, ids: Map<string,string>, now: string, created: bo
 
 // Every row here is written inside the caller's guarded BEGIN IMMEDIATE transaction.
 // The revision content object is authoritative; typed tables are rebuildable projections.
-export function persistPatch(db: DatabaseSync, companion: string, patch: CandidatePatch, now: string, hook: (point: string) => void): CommitResult {
+export function persistPatch(db: DatabaseSync, companion: string, patch: CandidatePatch, now: string, hook: (point: string) => void,allowRetraction=false): CommitResult {
   requireState(db.isTransaction, 'TRANSACTION_REQUIRED', 'Patch commits require one transaction');
+  for(const mutation of patch.mutations) {
+    requireState(allowRetraction || allEvidence(mutation.record).length<=128,'BUDGET_EXCEEDED','The complete evidence set exceeds the read contract');
+    requireState(allowRetraction || mutation.record.content_status!=='retracted','VALIDATION_ERROR','Use retract_memory for source withdrawal; split and merge retire old records as disputed');
+  }
   const ids = new Map(patch.mutations.filter(item => item.operation === 'create').map(item => [item.temporary_id, `memory-${randomUUID()}`]));
   const records = patch.mutations.map(item => ({mutation: item, record: remap(item.record, ids, now, item.operation === 'create'), revision_id: `revision-${randomUUID()}`}));
   for (const item of records) {
@@ -90,7 +88,9 @@ export function persistPatch(db: DatabaseSync, companion: string, patch: Candida
     if (existing) requireState(hashJson(readJson(db,companion,existing.content_object_id as string))===hashJson(evidence), 'VALIDATION_ERROR','Evidence identity cannot change');
     else {
       db.prepare('INSERT INTO evidence_catalog VALUES(?,?,?)').run(evidence.id,companion,putJson(db,companion,evidence));
-      requireState(evidence.source.kind==='message','UNSUPPORTED_SOURCE','Legacy import is not implemented in phase 2');
+    }
+    if(!db.prepare('SELECT id FROM evidence WHERE companion_id=? AND id=?').get(companion,evidence.id)) {
+      requireState(evidence.source.kind==='message','UNSUPPORTED_SOURCE','Legacy import is not implemented yet');
       db.prepare('INSERT INTO evidence VALUES(?,?,?,?,?,?,?, ?,?)').run(evidence.id,companion,firstRevision,evidence.speaker_actor_id,
         messageVersionId(db,companion,evidence.source.ref),null,evidence.quote,evidence.start,evidence.end);
     }

@@ -124,3 +124,10 @@ export type ResponseNeedRecord = z.infer<typeof ResponseNeedRecordSchema>;
 export type Memory = z.infer<typeof MemorySchema>;
 export type PreferenceValue = z.infer<typeof PreferenceValueSchema>;
 export type CandidatePatch = z.infer<typeof CandidatePatchSchema>;
+
+export function memoryEvidenceIds(memory:Memory):string[] {
+  const ids=[...memory.evidence_ids];
+  if(memory.kind==='episode') ids.push(...memory.occurred.evidence_ids,...memory.interpretations.flatMap(item=>[...item.evidence_ids,...item.felt_time.evidence_ids,...item.retrospective_evidence_ids]));
+  if(memory.kind==='communication_pattern')ids.push(...memory.counterexample_evidence_ids);
+  return [...new Set(ids)];
+}

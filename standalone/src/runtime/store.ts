@@ -2,11 +2,15 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
+import * as z from 'zod';
 import { initializeConfig, prepareHome, readConfig, writeExclusive, type RuntimeConfig } from '../config.ts';
 import { canonicalJson, hashJson, sha256Bytes } from '../contracts/canonical.ts';
 import { CandidatePatchSchema, type CandidatePatch, type Memory } from '../domain/memory.ts';
-import { ObserveInputSchema, type ObserveData } from '../contracts/tools.ts';
-import { validateCandidate, validateToolInput, type ValidationContext, type ContractResult } from '../contracts/validation.ts';
+import { ObserveInputSchema, toolContracts, ErrorCodeSchema, type ObserveData, type ToolName, type ToolInput, type ToolOutput } from '../contracts/tools.ts';
+import { validateCandidate, validateToolInput, validateToolOutput, messageKey, type ValidationContext, type ContractResult } from '../contracts/validation.ts';
+import { MessageRefSchema, sliceCodePoints, codePointLength } from '../domain/common.ts';
+import { recallView, episodeView } from '../services/read-views.ts';
+import { writeTool } from '../services/tool-writes.ts';
 import { acquireOwner, openDatabase, transaction } from '../db/connection.ts';
 import { currentMemory, loadContext, storedId } from '../db/context.ts';
 import { JobQueue, type JobLease } from '../db/jobs.ts';
@@ -79,16 +83,16 @@ export class RuntimeStore {
     this.#closed=true;
     try { this.#db.close(); } finally { this.#releaseOwner(); }
   }
-  authenticate(token:string,required:Capability='read'): Principal {
+  authenticate(token:string,required:Capability|null='read'): Principal {
     requireState(/^fmc_[A-Za-z0-9_-]{43}$/.test(token),'FORBIDDEN','Invalid credential');
     const digest=sha256Bytes(Buffer.from(token));
     const row=this.#db.prepare('SELECT id,companion_id,capability FROM credentials WHERE token_sha256=? AND companion_id=? AND enabled=1').get(digest,this.companion);
-    requireState(row && (row.capability===required || row.capability==='admin'),'FORBIDDEN','Credential lacks the required capability');
+    requireState(row && (required===null || row.capability===required || row.capability==='admin'),'FORBIDDEN','Credential lacks the required capability');
     return {id:row.id as string,companion_id:row.companion_id as string,capability:row.capability as Capability};
   }
-  private requirePrincipal(id:string,required:Capability): Principal {
+  private requirePrincipal(id:string,required:Capability|null): Principal {
     const row=this.#db.prepare('SELECT id,capability FROM credentials WHERE companion_id=? AND id=? AND enabled=1').get(this.companion,id);
-    requireState(row && (row.capability===required || row.capability==='admin'),'FORBIDDEN','Credential is disabled or lacks the required capability');
+    requireState(row && (required===null || row.capability===required || row.capability==='admin'),'FORBIDDEN','Credential is disabled or lacks the required capability');
     return {id,companion_id:this.companion,capability:row.capability as Capability};
   }
   issueCredential(capability:Capability): {id:string;token:string} {
@@ -151,6 +155,53 @@ export class RuntimeStore {
     requireState(valid?.status==='valid' && valid.version===value.version,'STALE_INPUT','Memory depends on edited input and is awaiting reprocessing');
     return value;
   }
+  allowedTools(principal:string):ToolName[] {
+    const identity=this.requirePrincipal(principal,null),capabilities=this.capabilities(identity);
+    return (Object.keys(toolContracts) as ToolName[]).filter(name=>capabilities.has(toolContracts[name].capability));
+  }
+  invokeTool(principal:string,name:ToolName,raw:unknown):ToolOutput<ToolName> {
+    try {
+      requireState(Object.hasOwn(toolContracts,name),'VALIDATION_ERROR','Unknown memory tool');
+      const identity=this.requirePrincipal(principal,toolContracts[name].capability);
+      const parsed=toolContracts[name].input.safeParse(raw);
+      requireState(parsed.success,'VALIDATION_ERROR','Tool input does not match its contract');
+      const input=parsed.data;
+      const success=(data:unknown,context:ValidationContext)=>this.checked(validateToolOutput(name,input,{contract_version:'1.0.0',outcome:{status:'ok',data}},context));
+      if(name==='observe_turn') return success(this.observe(principal,input).value,loadContext(this.#db,this.companion,this.capabilities(identity)));
+      if(name==='recall_context' || name==='get_episode') {
+        const context=loadContext(this.#db,this.companion,this.capabilities(identity));
+        this.checked(validateToolInput(name,input,context));
+        return success(name==='recall_context'?recallView(this.#db,input as ToolInput<'recall_context'>,context):episodeView(this.#db,input as ToolInput<'get_episode'>,context),context);
+      }
+      const write=input as ToolInput<'correct_memory'|'set_memory_preference'|'retract_memory'>;
+      return this.idempotent(principal,'user_edit',name,write.request_id,write,()=>{
+        const context=loadContext(this.#db,this.companion,this.capabilities(identity));
+        this.checked(validateToolInput(name,write,context));
+        this.#db.prepare('INSERT INTO interactive_changes VALUES(?,?,?,?,?)').run(this.companion,principal,name,write.request_id,putJson(this.#db,this.companion,write));
+        const data=writeTool(this.#db,name,write,context,this.#clock().toISOString(),this.#fault);
+        return success(data,context);
+      }).value;
+    } catch(error) {
+      const code=ErrorCodeSchema.safeParse(error instanceof RuntimeError?error.code:'MODEL_UNAVAILABLE');
+      return {contract_version:'1.0.0',outcome:{status:'error',error:{code:code.success?code.data:'MODEL_UNAVAILABLE',
+        message:error instanceof RuntimeError && code.success?error.message.slice(0,512):'Memory service is temporarily unavailable; no successful change is reported.',
+        retryable:!code.success || ['VERSION_CONFLICT','STALE_INPUT','MODEL_UNAVAILABLE'].includes(code.data),paths:[]}}};
+    }
+  }
+  createUserEvidence(principal:string,raw:unknown) {
+    const input=z.strictObject({request_id:z.string().min(1).max(128),ref:MessageRefSchema,start:z.int().nonnegative(),end:z.int().positive()}).parse(raw);
+    return this.idempotent(principal,'user_edit','host_evidence',input.request_id,input,()=>{
+      const context=loadContext(this.#db,this.companion,new Set(['user_edit'])),source=context.messages.get(messageKey(input.ref));
+      requireState(source?.active && source.role==='user' && !source.suppressed,'STALE_INPUT','Evidence must refer to an active unsuppressed visible user message');
+      requireState(input.end>input.start && input.end<=codePointLength(source.text) && input.end-input.start<=8000,'VALIDATION_ERROR','Evidence must use an exact bounded code-point span');
+      const id=storedId('evidence',[this.companion,messageKey(input.ref),String(input.start),String(input.end)]);
+      const evidence={id,companion_id:this.companion,source:{kind:'message' as const,ref:input.ref},speaker_actor_id:source.actor_id,
+        quote:sliceCodePoints(source.text,input.start,input.end),start:input.start,end:input.end};
+      if(!this.#db.prepare('SELECT id FROM evidence_catalog WHERE id=? AND companion_id=?').get(id,this.companion))
+        this.#db.prepare('INSERT INTO evidence_catalog VALUES(?,?,?)').run(id,this.companion,putJson(this.#db,this.companion,evidence));
+      return evidence;
+    }).value;
+  }
   saveCandidate(lease:JobLease,raw:unknown): void {
     this.assertWritable();
     transaction(this.#db,()=>{
@@ -160,6 +211,7 @@ export class RuntimeStore {
       requireState(patch.job_id===lease.job_id && patch.input_watermark.conversation_id===input.conversation_id
         && patch.input_watermark.branch_id===input.branch_id && patch.input_watermark.chain_revision===input.chain_revision
         && patch.input_watermark.sequence===input.sequence,'STALE_INPUT','Candidate belongs to another job input');
+      for(const mutation of patch.mutations) requireState(mutation.record.content_status!=='retracted','VALIDATION_ERROR','Automatic candidates cannot withdraw sources; use the user retract tool');
       for (const mutation of patch.mutations) if (mutation.record.kind==='episode') {
         const previous=context.memories.get(mutation.record.id);
         requireState(mutation.record.storage_tier===(previous?.kind==='episode'?previous.storage_tier:'hot'),'VALIDATION_ERROR','Model candidates cannot change physical storage tiers');
@@ -198,7 +250,7 @@ export class RuntimeStore {
   }
   status(): Record<string,unknown> {
     const count=(table:string)=>Number(this.#db.prepare(`SELECT count(*) AS n FROM ${table}`).get()!.n);
-    return {phase:2,mcp_connected:false,model_worker_enabled:false,companion_id:this.companion,
+    return {phase:3,mcp_available:true,model_worker_enabled:false,companion_id:this.companion,
       schema_version:this.#db.prepare('SELECT max(version) AS n FROM schema_migrations').get()!.n,
       journal_mode:this.#db.prepare('PRAGMA journal_mode').get()!.journal_mode,
       messages:count('turn_versions'),memories:count('memory_records'),receipts:count('write_requests'),

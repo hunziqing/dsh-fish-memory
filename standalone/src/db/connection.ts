@@ -9,6 +9,7 @@ export function migrations(): Migration[] {
   return [
     {version: 1, name: 'initial-contract', sql: readFileSync(new URL('../../contracts/database/001-initial.sql', import.meta.url), 'utf8')},
     {version: 2, name: 'runtime-persistence', sql: readFileSync(new URL('./migrations/002-runtime.sql', import.meta.url), 'utf8')},
+    {version: 3, name: 'tool-service', sql: readFileSync(new URL('./migrations/003-tool-service.sql', import.meta.url), 'utf8')},
   ];
 }
 export function transaction<T>(db: DatabaseSync, work: () => T): T {

@@ -1,10 +1,12 @@
 {
   "name": "fish-companion-memory",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "Standalone companion memory service: validated contracts and persistent runtime foundation.",
-  "engines": { "node": ">=24.19.0 <25" },
+  "engines": {
+    "node": ">=24.19.0 <25"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "schemas:write": "node scripts/export-schemas.ts",
@@ -16,6 +18,14 @@
     "smoke:built": "node scripts/smoke-built.ts",
     "check": "npm run typecheck && npm run schemas:check && npm test && npm run build && npm run smoke:built"
   },
-  "dependencies": { "zod": "4.6.7" },
-  "devDependencies": { "@types/node": "24.19.2", "typescript": "7.0.2" }
+  "dependencies": {
+    "@modelcontextprotocol/client": "2.4.0",
+    "@modelcontextprotocol/node": "2.1.2",
+    "@modelcontextprotocol/server": "2.4.0",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "typescript": "7.0.2"
+  }
 }
